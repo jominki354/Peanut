@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, create_engine, select, func, delete, Table, MetaData
+from sqlalchemy import Column, Integer, String, Text, DateTime, create_engine, select, func, delete, Table, MetaData, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -20,27 +20,37 @@ class DiscordMessage(Base):
     """디스코드 메시지를 저장하는 모델"""
     __tablename__ = 'discord_messages'
     
-    id = Column(Integer, primary_key=True)
-    message_id = Column(String(32), nullable=False, unique=True, index=True)
-    channel_id = Column(String(32), nullable=False, index=True)
-    guild_id = Column(String(32), nullable=False, index=True)
-    channel_name = Column(String(100), nullable=True)
-    guild_name = Column(String(100), nullable=True)
-    author_id = Column(String(32), nullable=False, index=True)
-    author_name = Column(String(100), nullable=True)
-    content = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, index=True)
+    id = Column(String, primary_key=True)
+    message_id = Column(String, index=True)
+    channel_id = Column(String, index=True)
+    guild_id = Column(String, index=True)
+    author_id = Column(String, index=True)
+    author_name = Column(String)
+    content = Column(Text)
+    created_at = Column(DateTime)
     attachments_count = Column(Integer, default=0)
-    attachments_urls = Column(Text, nullable=True)
-    collected_at = Column(DateTime, default=datetime.utcnow)
+    attachments_urls = Column(Text)
+    collected_at = Column(DateTime, default=datetime.now)
     
-    # 새로운 필드 추가
-    message_url = Column(String(256), nullable=True)  # 메시지 링크
-    topics = Column(Text, nullable=True)  # JSON으로 저장된 주제 목록
-    message_type = Column(String(50), nullable=True)  # 메시지 유형 (질문, 설명, 코드 등)
-    content_structure = Column(Text, nullable=True)  # JSON으로 저장된 콘텐츠 구조 분석
-    markdown_used = Column(Text, nullable=True)  # JSON으로 저장된 사용된 마크다운 분석
-    sections = Column(Text, nullable=True)  # JSON으로 저장된 메시지 섹션 구조
+    # 채널, 서버 이름 (조회 편의를 위해 저장)
+    channel_name = Column(String)
+    guild_name = Column(String)
+    
+    # 메시지 링크
+    message_url = Column(String)
+    
+    # 스레드 관련 필드
+    is_thread = Column(Boolean, default=False)
+    thread_name = Column(String)
+    parent_channel_id = Column(String)
+    parent_channel_name = Column(String)
+    
+    # 분석 정보
+    topics = Column(Text)
+    message_type = Column(String)
+    content_structure = Column(Text)
+    markdown_used = Column(Text)
+    sections = Column(Text)
 
 class CollectionMetadata(Base):
     """메시지 수집 메타데이터 저장 모델"""
@@ -141,27 +151,64 @@ class DatabaseManager:
             return result.scalar() is not None
     
     async def save_messages(self, messages):
-        """메시지 목록을 데이터베이스에 저장"""
+        """디스코드 메시지 저장 (배치)
+        
+        Args:
+            messages: 저장할 메시지 딕셔너리 목록
+            
+        Returns:
+            저장된 메시지 수
+        """
         if not messages:
             return 0
             
         saved_count = 0
         async with self.AsyncSessionLocal() as session:
-            for message_data in messages:
-                # 이미 저장된 메시지인지 확인
-                exists = await self.message_exists(message_data['message_id'])
-                if exists:
+            for msg_data in messages:
+                if not msg_data:  # None인 경우 건너뜀
                     continue
                     
-                # 새 메시지 객체 생성 및 저장
-                new_message = DiscordMessage(**message_data)
-                session.add(new_message)
-                saved_count += 1
-                
-            if saved_count > 0:
+                # id 필드 설정 (message_id와 동일)
+                if 'id' not in msg_data and 'message_id' in msg_data:
+                    msg_data['id'] = msg_data['message_id']
+                    
+                # 필드 검증 및 변환
+                for field, value in list(msg_data.items()):
+                    # 존재하지 않는 필드는 제거
+                    if not hasattr(DiscordMessage, field):
+                        msg_data.pop(field, None)
+                        
+                try:
+                    # 기존 메시지가 있는지 확인
+                    msg_id = msg_data.get('message_id')
+                    query = select(DiscordMessage).where(DiscordMessage.message_id == msg_id)
+                    result = await session.execute(query)
+                    existing_message = result.scalar_one_or_none()
+                    
+                    if existing_message:
+                        # 기존 메시지 업데이트
+                        for field, value in msg_data.items():
+                            if hasattr(existing_message, field):
+                                setattr(existing_message, field, value)
+                    else:
+                        # 새 메시지 생성
+                        new_message = DiscordMessage(**msg_data)
+                        session.add(new_message)
+                        
+                    saved_count += 1
+                except Exception as e:
+                    logger.error(f"메시지 저장 중 오류 발생: {str(e)}")
+                    logger.error(f"문제가 된 메시지 데이터: {msg_data}")
+                    continue
+                    
+            # 커밋
+            try:
                 await session.commit()
-                
-        return saved_count
+                return saved_count
+            except Exception as e:
+                logger.error(f"데이터베이스 커밋 중 오류 발생: {str(e)}")
+                await session.rollback()
+                return 0
     
     async def get_message_count(self, guild_id=None, channel_id=None):
         """저장된 메시지 수 조회"""
@@ -282,6 +329,32 @@ class DatabaseManager:
                 logger.error(f"저장된 날짜 형식이 올바르지 않습니다: {time_str}")
                 return None
         return None
+
+    async def get_last_message_id(self, channel_id):
+        """지정된 채널의 가장 최근 메시지 ID를 조회
+        
+        Args:
+            channel_id: 채널 ID
+            
+        Returns:
+            가장 최근 메시지 ID 또는 None
+        """
+        try:
+            async with self.AsyncSessionLocal() as session:
+                # 생성 시간순으로 정렬하여 가장 최근 메시지 조회
+                query = select(DiscordMessage.message_id).where(
+                    DiscordMessage.channel_id == str(channel_id)
+                ).order_by(
+                    DiscordMessage.created_at.desc()
+                ).limit(1)
+                
+                result = await session.execute(query)
+                last_message_id = result.scalar()
+                
+                return last_message_id
+        except Exception as e:
+            logger.error(f"마지막 메시지 ID 조회 중 오류 발생: {str(e)}")
+            return None
 
 # 데이터베이스 매니저 인스턴스 생성 - 딕셔너리로 여러 인스턴스 관리
 db_managers = {}

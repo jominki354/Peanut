@@ -22,11 +22,12 @@ logger = logging.getLogger('discord.llm')
 class LLMManager:
     """외부 LLM API를 사용하는 클래스"""
     
-    def __init__(self, api_url=None):
+    def __init__(self, api_url=None, guild_id=None):
         """LLM 매니저 초기화
         
         Args:
             api_url: LLM API URL, 없으면 환경 변수에서 가져옴
+            guild_id: 서버 ID, 지정하면 서버별 데이터베이스를 사용함
         """
         from ..utils.config import get_config
         
@@ -42,11 +43,19 @@ class LLMManager:
         # 초기화 상태
         self.is_initialized = False
         
+        # 서버 ID 설정
+        self.guild_id = guild_id
+        
         # 데이터베이스 매니저
-        self.db_manager = get_db_manager()
+        self.db_manager = get_db_manager(guild_id=self.guild_id)
         
         # 봇의 사용자 ID (메시지 필터링용)
         self.bot_id = self.config.get('BOT_ID', None)
+        # 봇 ID 목록으로 변환 (쉼표로 구분된 문자열일 경우)
+        self.bot_id_list = []
+        if self.bot_id:
+            self.bot_id_list = [bid.strip() for bid in self.bot_id.split(',') if bid.strip()]
+            logger.info(f"메시지 검색에서 제외할 봇 ID 목록: {self.bot_id_list}")
         
         logger.info(f"LLM 매니저가 초기화되었습니다. API URL: {self.api_url}")
         if self.model_name:
@@ -240,8 +249,16 @@ class LLMManager:
                     ]
                     
                     # 봇 ID 필터링
-                    if self.bot_id:
-                        conditions.append(DiscordMessage.author_id != self.bot_id)
+                    if self.bot_id_list:
+                        # 여러 봇 ID 처리
+                        bot_conditions = []
+                        for bot_id in self.bot_id_list:
+                            bot_conditions.append(DiscordMessage.author_id != bot_id)
+                        
+                        if bot_conditions:
+                            # 모든 봇 ID를 제외하는 조건 (AND 연산)
+                            for condition in bot_conditions:
+                                conditions.append(condition)
                     
                     # 직접 검색 - 정확한 매치
                     direct_conditions = []
@@ -297,8 +314,16 @@ class LLMManager:
                 ]
                 
                 # 봇 ID 필터링
-                if self.bot_id:
-                    conditions.append(DiscordMessage.author_id != self.bot_id)
+                if self.bot_id_list:
+                    # 여러 봇 ID 처리
+                    bot_conditions = []
+                    for bot_id in self.bot_id_list:
+                        bot_conditions.append(DiscordMessage.author_id != bot_id)
+                    
+                    if bot_conditions:
+                        # 모든 봇 ID를 제외하는 조건 (AND 연산)
+                        for condition in bot_conditions:
+                            conditions.append(condition)
                 
                 # 1단계: 정확한 키워드 기반 검색 (첫 3개 키워드)
                 primary_keywords = keywords[:3] if len(keywords) >= 3 else keywords
@@ -514,8 +539,10 @@ class LLMManager:
                 )
                 
                 # 봇 ID가 설정되어 있으면 봇 메시지 제외
-                if self.bot_id:
-                    stmt = stmt.where(DiscordMessage.author_id != self.bot_id)
+                if self.bot_id_list:
+                    # 여러 봇 ID 처리
+                    for bot_id in self.bot_id_list:
+                        stmt = stmt.where(DiscordMessage.author_id != bot_id)
                 
                 # 최근 메시지부터 정렬
                 stmt = stmt.order_by(DiscordMessage.created_at.desc()).limit(limit)
@@ -558,6 +585,9 @@ class LLMManager:
             {"role": "system", "content": system_prompt}
         ]
         
+        # 컨텍스트 메시지가 없거나 관련 없는 메시지인지 확인
+        has_relevant_context = False
+        
         # 인식할 수 있는 최대 토큰(문자) 수 제한에 맞게 메시지 추가
         try:
             if context_messages:
@@ -567,22 +597,129 @@ class LLMManager:
                     key=lambda x: x.get('created_at', '0') if x.get('created_at') else '0'
                 )
                 
-                for msg in sorted_messages:
-                    # 메시지를 context로 변환하고 추가
-                    context_message = {"role": "user", "content": ""}
+                # 키워드와 메시지 내용의 관련성 검사
+                keywords = self.extract_keywords(query)
+                if keywords and sorted_messages:
+                    # 모든 키워드 추출 (분해된 키워드 포함)
+                    all_keywords = keywords.copy()
+                    decomposed_keywords = []
                     
-                    # 메시지 내용
-                    formatted_content = msg.get('content', '')
+                    # 분해된 키워드 추가 (예: '당근파일럿'의 경우 '당근', '파일럿' 추가)
+                    for keyword in keywords:
+                        if len(keyword) >= 4:
+                            # 한글의 경우 보통 2글자씩 의미를 가지므로 2글자 단위로 분해
+                            # 영문이나 혼합된 경우는 그대로 사용
+                            if re.match(r'^[가-힣]+$', keyword):
+                                for i in range(0, len(keyword), 2):
+                                    if i + 2 <= len(keyword):
+                                        part = keyword[i:i+2]
+                                        if len(part) >= 2 and part not in all_keywords:
+                                            decomposed_keywords.append(part)
                     
-                    # add_info 함수 호출
-                    new_context_message = self.add_info(context_message, msg)
+                    # 주요 키워드와 분해 키워드 구분 (주요 키워드에 우선 점수 부여)
+                    all_keywords.extend(decomposed_keywords)
                     
-                    # 메시지가 유효한 경우 추가
-                    if new_context_message:
-                        messages.append(new_context_message)
+                    # 각 메시지에 대한 관련성 점수 계산
+                    message_scores = []
+                    
+                    for msg in sorted_messages:
+                        content = msg.get('content', '').lower()
+                        score = 0
+                        matched_keywords = []
+                        
+                        # 1. 주요 키워드 먼저 확인 (원본 키워드)
+                        for keyword in keywords:
+                            if len(keyword) >= 2 and keyword.lower() in content:
+                                # 주요 키워드 매치는 높은 점수 부여
+                                score += 5
+                                matched_keywords.append(keyword)
+                                # 첫 2개 키워드는 중요도가 더 높음
+                                if keyword in keywords[:2]:
+                                    score += 3
+                        
+                        # 2. 분해 키워드 확인 (더 낮은 가중치)
+                        for keyword in decomposed_keywords:
+                            if len(keyword) >= 2 and keyword.lower() in content:
+                                # 분해된 키워드는 낮은 점수 부여
+                                score += 1
+                                matched_keywords.append(keyword)
+                        
+                        # 3. 특별한 케이스: '당근파일럿'과 같은 주요 복합 키워드가 있는 경우
+                        # 이 경우 '당근'과 '설치'만 있는 메시지보다 '당근파일럿'을 포함한 메시지를 우선시
+                        for i, keyword in enumerate(keywords):
+                            if i == 0 and len(keyword) >= 4 and keyword.lower() in content:
+                                # 첫 번째 키워드(가장 중요)가 메시지에 포함되어 있으면 추가 점수
+                                score += 10
+                        
+                        # 점수가 있는 메시지만 후보로 기록
+                        if score > 0:
+                            message_scores.append((msg, score, matched_keywords))
+                    
+                    # 점수 기준 정렬 (높은 점수가 앞으로)
+                    message_scores.sort(key=lambda x: x[1], reverse=True)
+                    
+                    # 점수 로깅 및 관련성 여부 결정
+                    if message_scores:
+                        # 최소 점수 기준 설정 (조정 가능)
+                        min_score_threshold = 3  # 기존 5에서 3으로 낮춤 - 당조3 같은 짧은 키워드에 적합
+                        
+                        # 높은 점수의 메시지가 있다면 관련성 있다고 판단
+                        if message_scores[0][1] >= min_score_threshold:
+                            has_relevant_context = True
+                            top_message, score, matched = message_scores[0]
+                            logger.info(f"가장 관련성 높은 메시지 (점수: {score}): {top_message.get('content', '')[:50]}...")
+                            logger.info(f"일치 키워드: {', '.join(matched)}")
+                        else:
+                            # 점수가 낮은 경우, 첫 번째 주요 키워드가 포함된 메시지가 있는지 확인
+                            if keywords and any(keywords[0].lower() in msg.get('content', '').lower() for msg, _, _ in message_scores):
+                                has_relevant_context = True
+                                logger.info(f"주요 키워드 '{keywords[0]}' 포함 메시지가 있어 관련성 있다고 판단함")
+                            else:
+                                # 점수가 낮고 주요 키워드도 없는 경우는 관련성이 낮다고 판단
+                                has_relevant_context = False
+                                logger.warning(f"메시지가 있지만 관련성 점수가 낮습니다 (최고 점수: {message_scores[0][1] if message_scores else 0})")
+                    else:
+                        # 키워드가 직접 매치되지 않은 경우, 단순히 메시지가 존재하는지만 확인
+                        # 이는 find_relevant_messages가 이미 필터링을 했다는 것을 감안한 접근
+                        if sorted_messages:
+                            has_relevant_context = True
+                            logger.info("점수화되지 않았지만 관련 메시지가 존재합니다.")
+                
+                # 관련 컨텍스트가 있는 경우에만 메시지 추가 
+                # 또는 점수화 결과를 기반으로 상위 메시지만 추가
+                sorted_messages_to_use = []
+                if has_relevant_context:
+                    # 점수화된 결과가 있으면 점수 기준으로 상위 메시지 선택
+                    if 'message_scores' in locals() and message_scores:
+                        # 점수 기준 상위 메시지만 사용 (최대 30개, 점수 2 이상)
+                        high_scored_messages = [msg for msg, score, _ in message_scores if score >= 2]  # 기존 4에서 2로 낮춤
+                        sorted_messages_to_use = high_scored_messages[:30]  # 상위 30개로 제한
+                        logger.info(f"점수 기준 선택된 메시지: {len(sorted_messages_to_use)}개")
+                    else:
+                        # 기존 방식대로 모든 메시지 사용
+                        sorted_messages_to_use = sorted_messages
+                    
+                    # 선택된 메시지를 API 요청에 추가
+                    for msg in sorted_messages_to_use:
+                        # 메시지를 context로 변환하고 추가
+                        context_message = {"role": "user", "content": ""}
+                        
+                        # add_info 함수 호출
+                        new_context_message = self.add_info(context_message, msg)
+                        
+                        # 메시지가 유효한 경우 추가
+                        if new_context_message:
+                            messages.append(new_context_message)
             
-            # 사용자 질문 추가
-            messages.append({"role": "user", "content": query})
+            # 사용자 질문 추가 (컨텍스트 관련성 정보 포함)
+            if not has_relevant_context:
+                # 관련 정보가 없는 경우 명확한 지시를 포함한 질문으로 변경
+                enhanced_query = f"{query}\n\n참고: 이 질문에 관련된 정보가 데이터베이스에 없습니다. 질문과 관련된 정보가 없다고 명확하게 답변해주세요. 관련 없는 내용으로 답변하지 마세요."
+                messages.append({"role": "user", "content": enhanced_query})
+            else:
+                # 관련 정보가 있는 경우 해당 정보를 활용하도록 지시
+                enhanced_query = f"{query}\n\n참고: 위 메시지들에 질문과 관련된 정보가 제공되었습니다. 이 정보를 바탕으로 질문에 답변해주세요. 제공된 정보가 질문과 직접적으로 일치하지 않더라도, 간접적으로 관련된 정보를 활용하여 가능한 한 도움이 되는 답변을 제공하세요. 완전히 관련 없는 정보만 있다면 솔직하게 '관련 정보를 찾을 수 없습니다'라고 답변하세요."
+                messages.append({"role": "user", "content": enhanced_query})
             
             # API 요청 실행 (aiohttp 사용)
             async with aiohttp.ClientSession() as session:
@@ -615,11 +752,17 @@ class LLMManager:
             logger.info(f"[✅] 응답 생성 완료 (소요시간: {elapsed_time:.2f}초)")
             logger.info(f"[📊] 토큰 사용량: 프롬프트 {usage['prompt_tokens']}개, 응답 {usage['completion_tokens']}개")
             
+            # 컨텍스트 관련성 없을 때 로그 추가
+            if not has_relevant_context:
+                first_line = query.split('\n')[0] if '\n' in query else query
+                logger.warning(f"[⚠️] 질문 '{first_line}'에 관련된 컨텍스트가 없습니다. 관련 정보 없음 응답 생성")
+            
             return {
                 "response": model_response,
                 "usage": usage,
                 "status": "success",
-                "elapsed_time": elapsed_time
+                "elapsed_time": elapsed_time,
+                "has_relevant_context": has_relevant_context
             }
             
         except Exception as e:
@@ -640,17 +783,20 @@ class LLMManager:
 
 중요 지침:
 1. 외부 지식이나 정보는 절대 사용하지 마세요. 오직 제공된 메시지만 참고하세요.
-2. 제공된 메시지에 관련 정보가 없으면 "관련 정보를 찾을 수 없습니다. 좀 더 구체적인 질문을 해주시겠어요?"라고 솔직하게 답하세요.
-3. 답변에 정확한 정보만 포함시키세요. 추측하거나 채팅 기록에 없는 내용을 만들어내지 마세요.
-4. 디스코드 서버에서 수집된 메시지임을 명시적으로 언급하지 마세요.
-5. 출처나 작성자 정보를 절대 포함하지 마세요. 메시지 내용만 전달하세요.
-6. 어떤 형태로든 참조 정보나 출처를 표시하지 마세요. 어떠한 경우에도 참조 번호나 인용 표시를 사용하지 마세요.
-7. '~에 따르면', '~가 언급했듯이', '~의 메시지에서'와 같은 표현을 사용하지 마세요.
-8. 내용만 전달하고, 그 출처에 대해서는 어떤 언급도 하지 마세요.
-9. 메시지에 작성자, 시간, 채널 정보가 포함되어 있더라도 이를 응답에 언급하지 마세요.
-10. "참조 정보", "출처", "인용" 등의 섹션이나 표시를 절대 사용하지 마세요.
-11. 검색된 메시지가 짧더라도 내용을 그대로 사용하세요. 메시지를 추가 설명 없이 반환하지 마세요.
-12. 키워드가 일치하면 바로 관련 정보를 제공하세요. 추가 질문을 요청하거나 정보가 없다고 하지 마세요.
+2. 제공된 메시지에 관련 정보가 있으나 불완전하다면, 그 정보를 바탕으로 최대한 도움이 되는 답변을 제공하세요. 
+3. 제공된 메시지에 질문과 직접 관련된 정보가 전혀 없는 경우에만 "죄송합니다만, 질문하신 내용에 대한 관련 정보를 찾을 수 없습니다."라고 명확하게 답변하세요.
+4. 부분적으로 관련된 정보가 있다면, 그 정보를 활용하여 가능한 한 유용한 답변을 제공하세요.
+5. 답변에 정확한 정보만 포함시키세요. 추측하거나 채팅 기록에 없는 내용을 만들어내지 마세요.
+6. 디스코드 서버에서 수집된 메시지임을 명시적으로 언급하지 마세요.
+7. 출처나 작성자 정보를 절대 포함하지 마세요. 메시지 내용만 전달하세요.
+8. 어떤 형태로든 참조 정보나 출처를 표시하지 마세요. 어떠한 경우에도 참조 번호나 인용 표시를 사용하지 마세요.
+9. '~에 따르면', '~가 언급했듯이', '~의 메시지에서'와 같은 표현을 사용하지 마세요.
+10. 내용만 전달하고, 그 출처에 대해서는 어떤 언급도 하지 마세요.
+11. 메시지에 작성자, 시간, 채널 정보가 포함되어 있더라도 이를 응답에 언급하지 마세요.
+12. "참조 정보", "출처", "인용" 등의 섹션이나 표시를 절대 사용하지 마세요.
+13. 검색된 메시지가 짧더라도 내용을 그대로 사용하세요. 메시지를 추가 설명 없이 반환하지 마세요.
+14. 질문과 간접적으로라도 관련된 내용이 있다면 그 내용을 활용해 답변하세요. 완전히 관련 없는 경우에만 관련 정보가 없다고 답변하세요.
+15. 절대로 "관련 정보가 없지만, ..."과 같은 식으로 답변하지 마세요. 관련 정보가 전혀 없는 경우에만 "관련 정보를 찾을 수 없습니다"라고 답변하세요.
 
 답변 형식:
 - 존댓말을 쓰며 친근하고 전문성있게 대답하세요.
@@ -701,10 +847,26 @@ class LLMManager:
 
 # LLM 매니저 싱글톤 인스턴스
 _llm_manager = None
+_guild_llm_managers = {}
 
-def get_llm_manager() -> LLMManager:
-    """LLM 매니저 싱글톤 인스턴스 반환"""
-    global _llm_manager
+def get_llm_manager(guild_id=None) -> LLMManager:
+    """LLM 매니저 싱글톤 인스턴스 반환
+    
+    Args:
+        guild_id: 서버 ID, 지정하면 서버별 데이터베이스를 사용함
+        
+    Returns:
+        LLMManager 인스턴스
+    """
+    global _llm_manager, _guild_llm_managers
+    
+    # 서버 ID가 지정된 경우, 서버별 LLM 매니저 사용
+    if guild_id:
+        if guild_id not in _guild_llm_managers:
+            _guild_llm_managers[guild_id] = LLMManager(guild_id=guild_id)
+        return _guild_llm_managers[guild_id]
+    
+    # 기본 LLM 매니저
     if _llm_manager is None:
         _llm_manager = LLMManager()
     

@@ -23,6 +23,7 @@ class MessageCollector:
         self.db_manager = get_db_manager()  # 기본 DB 매니저 (하위 호환성 유지)
         self.is_collecting = False
         self.collection_tasks = {}
+        self.guild_collection_tasks = {}  # 서버별 수집 태스크
         self.config = get_config()
         self.bot_id = self.config.get('BOT_ID')
         self.collection_interval = int(self.config.get('COLLECTION_INTERVAL', 30 * 60))
@@ -200,12 +201,15 @@ class MessageCollector:
             message: Discord 메시지 객체
             
         Returns:
-            저장용 딕셔너리
+            저장용 딕셔너리 또는 None (무시할 메시지인 경우)
         """
         # 봇 메시지 필터링
-        if hasattr(self.bot, 'bot_id') and str(message.author.id) == self.bot.bot_id:
-            self.logger.debug(f"[🤖] 봇(ID: {self.bot.bot_id})의 메시지는 무시합니다: {message.id}")
-            return None
+        if hasattr(self.bot, 'bot_id'):
+            # 봇 ID가 쉼표로 구분된 여러 ID를 포함하는 경우 처리
+            bot_ids = [bot_id.strip() for bot_id in str(self.bot.bot_id).split(',')]
+            if str(message.author.id) in bot_ids:
+                logger.debug(f"[🤖] 봇(ID: {message.author.id})의 메시지는 무시합니다: {message.id}")
+                return None
             
         # 첨부 파일 처리
         attachments = []
@@ -216,21 +220,62 @@ class MessageCollector:
                 'size': attachment.size
             })
             
-        # 메시지 URL 생성
-        message_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
+        # 채널 및 서버 정보 처리
+        channel_name = None
+        guild_id = None
+        guild_name = None
+        message_url = None
         
+        # 채널 정보 확인
+        if hasattr(message.channel, 'name'):
+            channel_name = message.channel.name
+        else:
+            # 일부 채널 유형은 name 속성이 없을 수 있음
+            channel_name = f"채널-{message.channel.id}"
+            
+        # 스레드 처리
+        is_thread = False
+        thread_name = None
+        parent_channel_id = None
+        parent_channel_name = None
+        
+        # 채널 유형 확인
+        channel_type = None
+        try:
+            channel_type = message.channel.type
+        except Exception:
+            channel_type = None
+            
+        # 스레드인 경우 부모 채널 정보도 함께 저장
+        if channel_type in [discord.ChannelType.public_thread, discord.ChannelType.private_thread, discord.ChannelType.news_thread]:
+            is_thread = True
+            thread_name = getattr(message.channel, 'name', f"스레드-{message.channel.id}")
+            
+            # 부모 채널 정보
+            parent = getattr(message.channel, 'parent', None)
+            if parent:
+                parent_channel_id = str(parent.id)
+                parent_channel_name = getattr(parent, 'name', f"채널-{parent.id}")
+            
+        # 서버 정보 확인
+        if message.guild:
+            guild_id = str(message.guild.id)
+            guild_name = message.guild.name
+            
+            # 메시지 URL 생성
+            message_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
+        else:
+            # DM 또는 그룹 DM인 경우
+            message_url = f"https://discord.com/channels/@me/{message.channel.id}/{message.id}"
+            
         # 메시지 내용 분석
         content_analysis = self.analyze_message_content(message.content)
-        
-        # 채널 및 서버 이름
-        channel_name = message.channel.name if hasattr(message.channel, 'name') else None
-        guild_name = message.guild.name if message.guild else None
         
         # 저장용 딕셔너리 생성
         result = {
             'message_id': str(message.id),
             'channel_id': str(message.channel.id),
-            'guild_id': str(message.guild.id) if message.guild else None,
+            'guild_id': guild_id,
             'channel_name': channel_name,
             'guild_name': guild_name,
             'author_id': str(message.author.id),
@@ -250,47 +295,106 @@ class MessageCollector:
             'sections': json.dumps(content_analysis['sections'], ensure_ascii=False) if content_analysis['sections'] else None,
         }
         
+        # 스레드 관련 정보 추가
+        if is_thread:
+            result['is_thread'] = True
+            result['thread_name'] = thread_name
+            result['parent_channel_id'] = parent_channel_id
+            result['parent_channel_name'] = parent_channel_name
+            
         return result
     
-    async def collect_channel_messages(self, channel: discord.TextChannel, after_date: Optional[datetime] = None, db_manager=None):
+    async def collect_channel_messages(self, channel, after_date: Optional[datetime] = None, db_manager=None):
         """특정 채널의 메시지 수집
         
         Args:
-            channel: 디스코드 텍스트 채널 객체
+            channel: 디스코드 채널 객체 (TextChannel, ForumChannel, Thread 등)
             after_date: 이 날짜 이후의 메시지만 수집 (기본: None)
             db_manager: 사용할 데이터베이스 매니저 (기본: None, None이면 기본 매니저 사용)
             
         Returns:
             수집한 메시지 수
         """
-        if not isinstance(channel, discord.TextChannel):
+        # 모든 채널 유형 확인
+        channel_type = None
+        try:
+            channel_type = channel.type
+            channel_name = getattr(channel, 'name', str(channel.id))
+        except Exception as e:
+            logger.error(f"채널 타입 확인 중 오류 발생: {str(e)}")
             return 0
             
+        # 채널 유형에 따른 처리
+        if channel_type == discord.ChannelType.text:
+            channel_type_str = "텍스트"
+        elif channel_type == discord.ChannelType.voice:
+            channel_type_str = "음성"
+        elif channel_type == discord.ChannelType.forum:
+            channel_type_str = "포럼"
+        elif channel_type == discord.ChannelType.news:
+            channel_type_str = "뉴스"
+        elif channel_type in [discord.ChannelType.public_thread, discord.ChannelType.private_thread, discord.ChannelType.news_thread]:
+            channel_type_str = "스레드"
+        else:
+            channel_type_str = f"기타({channel_type})"
+            
         # 채널 또는 서버 권한 확인 (읽기 권한이 없으면 수집 불가)
-        if not channel.permissions_for(channel.guild.me).read_messages:
-            logger.warning(f"채널 '{channel.name}'({channel.id})에 대한 읽기 권한이 없어 메시지를 수집할 수 없습니다.")
+        can_read = False
+        try:
+            if hasattr(channel, 'permissions_for'):
+                perms = channel.permissions_for(channel.guild.me)
+                can_read = perms.read_messages
+            else:
+                # 스레드 등 일부 채널은 다른 방식으로 권한 확인
+                can_read = True  # 기본적으로 접근 가능하다고 가정
+        except Exception as e:
+            logger.warning(f"채널 권한 확인 중 오류 발생: {str(e)}")
+            can_read = False
+            
+        if not can_read:
+            logger.warning(f"{channel_type_str} 채널 '{channel_name}'({channel.id})에 대한 읽기 권한이 없어 메시지를 수집할 수 없습니다.")
             return 0
             
         # 권한이 있어도 봇이 채널을 볼 수 없는 다른 이유가 있을 수 있음
         try:
-            # 테스트로 채널 이름에 접근해봄
-            channel_name = channel.name
+            # 테스트로 채널 ID에 접근해봄
+            channel_id = channel.id
         except discord.errors.Forbidden:
             logger.warning(f"채널 ID {channel.id}에 접근할 수 없습니다. 권한 문제일 수 있습니다.")
             return 0
             
         try:
-            logger.info(f"채널 '{channel.name}'({channel.id}) 메시지 수집 시작")
+            logger.info(f"{channel_type_str} 채널 '{channel_name}'({channel.id}) 메시지 수집 시작")
             
             # 사용할 DB 매니저 결정
             if db_manager is None:
                 db_manager = self.db_manager
                 
+            # 채널별 마지막 수집 시간 키 생성
+            channel_last_collected_key = f"last_collected_channel_{channel.id}"
+                
             # 최근 저장된 메시지 날짜 확인
             if after_date is None:
-                after_date = await db_manager.get_latest_message_date(channel.guild.id, channel.id)
+                # 채널별 마지막 수집 시간 먼저 확인
+                channel_last_collected = await db_manager.get_collection_metadata(channel_last_collected_key)
+                if channel_last_collected:
+                    try:
+                        after_date = datetime.strptime(channel_last_collected, '%Y-%m-%d %H:%M:%S')
+                        logger.info(f"채널 '{channel_name}' 마지막 수집 시간: {after_date.strftime('%Y-%m-%d %H:%M:%S')}")
+                    except ValueError:
+                        logger.warning(f"채널 마지막 수집 시간 형식이 잘못되었습니다: {channel_last_collected}")
+                        after_date = None
+                
+                # 채널별 데이터가 없으면 데이터베이스의 최신 메시지로 확인
+                if after_date is None:
+                    after_date = await db_manager.get_latest_message_date(channel.guild.id, channel.id)
+                    if after_date:
+                        logger.info(f"채널 '{channel_name}' 최신 메시지 날짜: {after_date.strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 if after_date:
-                    logger.info(f"채널 '{channel.name}' 마지막 수집 날짜: {after_date.strftime('%Y-%m-%d %H:%M:%S')}")
+                    logger.info(f"'{channel_name}' 채널에서 {after_date.strftime('%Y-%m-%d %H:%M:%S')} 이후의 새 메시지만 수집합니다.")
+            else:
+                logger.info(f"'{channel_name}' 채널에서 {after_date.strftime('%Y-%m-%d %H:%M:%S')} 이후의 메시지만 수집합니다.")
                     
             # 메시지 수집
             processed_messages = []
@@ -300,32 +404,62 @@ class MessageCollector:
             batch_size = 50
             
             try:
-                # 메시지 검색 매개변수 설정
-                kwargs = {
-                    'limit': 100,  # 한 번에 최대 100개씩 가져오기
-                    'oldest_first': False  # 최신 메시지부터 가져오기
-                }
-                
-                if after_date:
-                    kwargs['after'] = after_date
+                if hasattr(channel, 'history'):
+                    # 일반 채널 및 스레드 처리
+                    # 메시지 검색 매개변수 설정
+                    kwargs = {
+                        'limit': 100,  # 한 번에 최대 100개씩 가져오기
+                        'oldest_first': False  # 최신 메시지부터 가져오기
+                    }
                     
-                async for message in channel.history(**kwargs):
-                    # 봇 자신의 메시지는 무시
-                    if self.bot_id and message.author.id == int(self.bot_id):
-                        continue
+                    if after_date:
+                        kwargs['after'] = after_date
                         
-                    # 메시지를 딕셔너리로 변환
-                    message_dict = self.message_to_dict(message)
-                    processed_messages.append(message_dict)
-                    collected_count += 1
-                    
-                    # 배치 단위로 저장
-                    if len(processed_messages) >= batch_size:
-                        await db_manager.save_messages(processed_messages)
-                        processed_messages = []
+                    async for message in channel.history(**kwargs):
+                        # 봇 자신의 메시지는 무시
+                        if self.bot_id:
+                            # BOT_ID가 쉼표로 구분된 여러 ID를 포함하는 경우 처리
+                            bot_ids = [bot_id.strip() for bot_id in str(self.bot_id).split(',')]
+                            if str(message.author.id) in bot_ids:
+                                continue
+                            
+                        # 메시지를 딕셔너리로 변환
+                        message_dict = self.message_to_dict(message)
+                        if message_dict:  # None이 아닌 경우에만 추가
+                            processed_messages.append(message_dict)
+                            collected_count += 1
                         
-                        # API 요청 제한 완화를 위한 짧은 대기
-                        await asyncio.sleep(0.1)
+                        # 배치 단위로 저장
+                        if len(processed_messages) >= batch_size:
+                            await db_manager.save_messages(processed_messages)
+                            processed_messages = []
+                            
+                            # API 요청 제한 완화를 위한 짧은 대기
+                            await asyncio.sleep(0.1)
+                elif channel_type == discord.ChannelType.forum:
+                    # 포럼 채널 처리 - 활성 스레드 수집
+                    if hasattr(channel, 'threads'):
+                        # 활성 스레드 처리
+                        for thread in channel.threads:
+                            thread_count = await self.collect_channel_messages(thread, after_date, db_manager)
+                            collected_count += thread_count
+                            
+                            # 스레드마다 잠시 대기 (레이트 리밋 방지)
+                            await asyncio.sleep(0.5)
+                        
+                        # 보관된 스레드도 처리
+                        if hasattr(channel, 'archived_threads'):
+                            try:
+                                async for thread in channel.archived_threads():
+                                    thread_count = await self.collect_channel_messages(thread, after_date, db_manager)
+                                    collected_count += thread_count
+                                    
+                                    # 스레드마다 잠시 대기 (레이트 리밋 방지)
+                                    await asyncio.sleep(0.5)
+                            except Exception as e:
+                                logger.warning(f"보관된 스레드 수집 중 오류 발생: {str(e)}")
+                else:
+                    logger.info(f"채널 타입 {channel_type_str}은(는) 현재 메시지 수집을 지원하지 않습니다.")
                 
                 # 남은 메시지 저장
                 if processed_messages:
@@ -333,59 +467,108 @@ class MessageCollector:
                     
                 # 수집 결과 로깅
                 if collected_count > 0:
-                    logger.info(f"채널 '{channel.name}'({channel.id})에서 {collected_count}개 메시지 수집 완료")
+                    logger.info(f"{channel_type_str} 채널 '{channel_name}'({channel.id})에서 {collected_count}개 메시지 수집 완료")
+                    
+                    # 채널별 마지막 수집 시간 업데이트
+                    now = datetime.utcnow()
+                    await db_manager.save_collection_metadata(channel_last_collected_key, now.strftime('%Y-%m-%d %H:%M:%S'))
+                    logger.debug(f"채널 '{channel_name}'({channel.id}) 마지막 수집 시간을 {now.strftime('%Y-%m-%d %H:%M:%S')}로 업데이트했습니다.")
                 else:
-                    logger.info(f"채널 '{channel.name}'({channel.id})에서 새로운 메시지가 없습니다.")
+                    logger.info(f"{channel_type_str} 채널 '{channel_name}'({channel.id})에서 새로운 메시지가 없습니다.")
                     
                 return collected_count
                 
             except discord.errors.Forbidden:
-                logger.warning(f"채널 '{channel.name}'({channel.id})에 접근할 권한이 없습니다.")
+                logger.warning(f"채널 '{channel_name}'({channel.id})에 접근할 권한이 없습니다.")
                 return 0
             except Exception as e:
-                logger.error(f"채널 '{channel.name}'({channel.id}) 메시지 수집 중 오류 발생: {str(e)}")
+                logger.error(f"채널 '{channel_name}'({channel.id}) 메시지 수집 중 오류 발생: {str(e)}")
                 return 0
                 
         except Exception as e:
             logger.error(f"채널 메시지 수집 중 예상치 못한 오류 발생: {str(e)}")
             return 0
     
-    async def collect_guild_messages(self, guild: discord.Guild, after_date: Optional[datetime] = None):
-        """서버의 모든 채널 메시지 수집
-        
-        Args:
-            guild: 디스코드 서버 객체
-            after_date: 이 날짜 이후의 메시지만 수집 (기본: None)
-            
-        Returns:
-            총 수집된 메시지 수
-        """
-        if not self.bot.is_guild_allowed(guild.id):
-            logger.info(f"서버 '{guild.name}'({guild.id})는 허용 목록에 없어 메시지를 수집하지 않습니다.")
+    async def collect_guild_messages(self, guild):
+        """특정 서버의 메시지를 수집"""
+        if self.is_collecting:
+            logger.warning(f"⚠️ 이미 메시지 수집 중입니다. 서버 '{guild.name}'({guild.id})의 수집을 건너뜁니다.")
             return 0
-        
-        # 서버별 데이터베이스 매니저 사용
+
+        # 서버별 DB 매니저 가져오기
         db_manager = self.bot.get_guild_db_manager(guild.id)
         
-        collected_count = 0
-        # 디스코드의 채널 순회 순서는 일정하지 않으므로,
-        # 이름 기준으로 정렬하여 로그를 일관되게 표시
-        sorted_channels = sorted(guild.text_channels, key=lambda c: c.name)
+        # 서버별 마지막 수집 시간 키
+        guild_last_collected_key = f"last_collected_guild_{guild.id}"
         
-        for channel in sorted_channels:
-            # 채널 수집 시 서버별 DB 매니저 전달
-            channel_count = await self.collect_channel_messages(channel, after_date, db_manager)
-            collected_count += channel_count
+        try:
+            self.is_collecting = True
+            logger.info(f"🔍 서버 '{guild.name}'({guild.id})의 메시지 수집 시작...")
+
+            # 텍스트 채널 목록 필터링
+            text_channels = [c for c in guild.channels if isinstance(c, discord.TextChannel)]
+            logger.info(f"ℹ️ 서버 '{guild.name}'({guild.id})의 텍스트 채널 수: {len(text_channels)}")
             
-            # 채널마다 잠시 대기 (레이트 리밋 방지)
-            await asyncio.sleep(1)
-        
-        logger.info(
-            f"{self.colors['success']}서버 '{guild.name}'({guild.id})에서 "
-            f"총 {collected_count}개의 메시지를 수집했습니다.{self.colors['reset']}"
-        )
-        
-        return collected_count
+            # 채널에서 마지막으로 수집한 메시지 ID 가져오기
+            last_message_ids = {}
+            for channel in text_channels:
+                last_msg_id = await db_manager.get_last_message_id(channel.id)
+                if last_msg_id:
+                    last_message_ids[channel.id] = int(last_msg_id)
+            
+            # 수집 시작 시간 기록
+            collection_start_time = datetime.utcnow()
+            total_collected = 0
+            
+            # 각 채널별로 메시지 수집
+            for channel in text_channels:
+                try:
+                    channel_collected = 0
+                    logger.info(f"🔍 채널 '{channel.name}'({channel.id}) 메시지 수집 중...")
+                    
+                    # 해당 채널의 마지막 메시지 ID 확인
+                    last_msg_id = last_message_ids.get(channel.id)
+                    if last_msg_id:
+                        logger.info(f"ℹ️ 채널 '{channel.name}'의 마지막 메시지 ID: {last_msg_id}")
+                        # 마지막 메시지 이후의 새 메시지만 수집
+                        async for message in channel.history(limit=None, after=discord.Object(id=last_msg_id)):
+                            # 메시지 정보 수집 및 저장
+                            await self._save_message(message, db_manager)
+                            channel_collected += 1
+                    else:
+                        # 첫 수집 시에는 최대 1000개 메시지만 수집
+                        async for message in channel.history(limit=1000):
+                            # 메시지 정보 수집 및 저장
+                            await self._save_message(message, db_manager)
+                            channel_collected += 1
+                    
+                    if channel_collected > 0:
+                        logger.info(f"✅ 채널 '{channel.name}'에서 {channel_collected}개 메시지 수집 완료")
+                    else:
+                        logger.info(f"ℹ️ 채널 '{channel.name}'에서 새 메시지 없음")
+                    
+                    total_collected += channel_collected
+                    
+                except discord.Forbidden:
+                    logger.warning(f"⚠️ 채널 '{channel.name}'({channel.id})에 접근 권한이 없습니다.")
+                except Exception as e:
+                    logger.error(f"❌ 채널 '{channel.name}'({channel.id}) 메시지 수집 중 오류: {str(e)}")
+            
+            # 마지막 수집 시간 업데이트 (서버별)
+            collection_end_time = datetime.utcnow()
+            collection_duration = (collection_end_time - collection_start_time).total_seconds()
+            
+            # 수집 메타데이터 저장
+            await db_manager.save_collection_metadata(guild_last_collected_key, collection_end_time.strftime('%Y-%m-%d %H:%M:%S'))
+            
+            logger.info(f"✅ 서버 '{guild.name}'({guild.id})의 메시지 수집 완료: {total_collected}개 메시지 (소요 시간: {collection_duration:.2f}초)")
+            return total_collected
+            
+        except Exception as e:
+            logger.error(f"❌ 서버 '{guild.name}'({guild.id})의 메시지 수집 중 오류 발생: {str(e)}")
+            return 0
+        finally:
+            self.is_collecting = False
     
     async def collect_all_guilds(self):
         """모든 허용된 서버에서 메시지 수집"""
@@ -399,6 +582,11 @@ class MessageCollector:
             start_time = datetime.now()
             logger.info(f"모든 서버 메시지 수집 시작 (시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')})")
             
+            # 마지막 전체 수집 시간 확인
+            global_last_collection_time = await self.db_manager.get_last_collection_time()
+            if global_last_collection_time:
+                logger.info(f"마지막 전체 수집 시간: {global_last_collection_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
             total_collected = 0
             guild_count = 0
             
@@ -407,7 +595,7 @@ class MessageCollector:
                 # 허용된 서버인지 확인
                 if self.bot.is_guild_allowed(guild.id):
                     guild_count += 1
-                    # 서버별 DB 사용하여 메시지 수집
+                    # 각 서버는 자체 마지막 수집 시간을 사용하므로 global_last_collection_time은 전달하지 않음
                     collected = await self.collect_guild_messages(guild)
                     total_collected += collected
                     
@@ -433,6 +621,7 @@ class MessageCollector:
             
             # 마지막 수집 시간 업데이트
             await self.db_manager.save_last_collection_time()
+            logger.info(f"전체 마지막 수집 시간이 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}로 업데이트되었습니다.")
             
         except Exception as e:
             logger.error(f"{self.colors['error']}메시지 수집 중 오류 발생: {str(e)}{self.colors['reset']}")
@@ -445,81 +634,114 @@ class MessageCollector:
         interval_minutes = self.collection_interval / 60
         logger.info(f"⏱️ 메시지 수집 스케줄러 시작: 수집 간격 {interval_minutes:.1f}분 ({self.collection_interval}초)")
         
-        # 마지막 수집 시간 조회
-        last_collection_time = await self.db_manager.get_last_collection_time()
+        # 허용된 서버 목록 가져오기
+        allowed_guilds = []
+        for guild in self.bot.guilds:
+            if self.bot.is_guild_allowed(guild.id):
+                allowed_guilds.append(guild)
         
-        if last_collection_time:
-            # 마지막 수집 시간 기준으로 다음 예정 시간 계산
-            time_since_last = (datetime.utcnow() - last_collection_time).total_seconds()
-            logger.info(f"ℹ️ 마지막 수집 시간: {last_collection_time.strftime('%Y-%m-%d %H:%M:%S')} (약 {time_since_last/60:.1f}분 전)")
+        # 각 서버에 대해 독립적인 수집 스케줄러 시작
+        for guild in allowed_guilds:
+            logger.info(f"서버 '{guild.name}'({guild.id})의 수집 스케줄러 설정 중...")
+            self.guild_collection_tasks[guild.id] = asyncio.create_task(
+                self.schedule_guild_collection(guild)
+            )
             
-            if time_since_last < self.collection_interval:
-                # 아직 수집 간격이 되지 않았으면, 시작 시 수집 안함
-                wait_time = self.collection_interval - time_since_last
-                next_collection = datetime.utcnow() + timedelta(seconds=wait_time)
-                logger.info(f"⏳ 다음 예정 수집 시간: {next_collection.strftime('%Y-%m-%d %H:%M:%S')} (약 {wait_time/60:.1f}분 후)")
-            else:
-                # 이미 수집 간격이 지났으면, 바로 첫 수집 시작
-                logger.info(f"🔄 마지막 수집 후 {time_since_last/60:.1f}분이 지났습니다. 즉시 수집을 시작합니다.")
-                collected = await self.collect_all_guilds()
-                logger.info(f"✅ 첫 번째 수집 완료: {collected}개 메시지")
-        else:
-            # 마지막 수집 시간 정보가 없으면 바로 첫 수집 시작
-            logger.info("🆕 최초 메시지 수집을 시작합니다...")
-            collected = await self.collect_all_guilds()
-            logger.info(f"✅ 첫 번째 수집 완료: {collected}개 메시지")
-        
-        # 메인 스케줄링 루프
+        # 모든 서버의 스케줄러가 완료될 때까지 대기
         while True:
+            await asyncio.sleep(60)  # 1분마다 상태 확인
+            
+            # 비정상 종료된 서버 스케줄러 다시 시작
+            for guild in self.bot.guilds:
+                if self.bot.is_guild_allowed(guild.id):
+                    if guild.id not in self.guild_collection_tasks or self.guild_collection_tasks[guild.id].done():
+                        logger.info(f"서버 '{guild.name}'({guild.id})의 수집 스케줄러 재시작 중...")
+                        self.guild_collection_tasks[guild.id] = asyncio.create_task(
+                            self.schedule_guild_collection(guild)
+                        )
+    
+    async def schedule_guild_collection(self, guild):
+        """서버별 메시지 수집 스케줄링"""
+        guild_id = guild.id
+        guild_name = guild.name
+        
+        # 서버별 DB 매니저 가져오기
+        db_manager = self.bot.get_guild_db_manager(guild_id)
+        
+        # 서버별 마지막 수집 시간 키
+        guild_last_collected_key = f"last_collected_guild_{guild_id}"
+        
+        # 서버별 메시지 수 확인
+        guild_messages = await db_manager.get_message_count(guild_id)
+        
+        # 마지막 수집 시간 조회 (서버별)
+        last_collection_time = await db_manager.get_collection_metadata(guild_last_collected_key)
+        if last_collection_time:
             try:
-                # 마지막 수집 시간 조회
-                last_collection_time = await self.db_manager.get_last_collection_time()
+                last_collection_time = datetime.strptime(last_collection_time, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                last_collection_time = None
+        
+        # 저장된 메시지가 없거나 마지막 수집 시간이 없으면 즉시 수집 시작
+        if guild_messages == 0 or not last_collection_time:
+            logger.info(f"💡 서버 '{guild_name}'({guild_id})의 저장된 메시지가 없거나 최초 실행입니다 (메시지 수: {guild_messages}). 즉시 수집을 시작합니다...")
+            collected = await self.collect_guild_messages(guild)
+            logger.info(f"✅ 서버 '{guild_name}'({guild_id})의 첫 번째 수집 완료: {collected}개 메시지")
+        elif last_collection_time:
+            # 마지막 수집 시간 기준으로 다음 예정 시간 계산
+            while True:
                 now = datetime.utcnow()
+                time_since_last = (now - last_collection_time).total_seconds()
+                logger.info(f"ℹ️ 서버 '{guild_name}'({guild_id}) 마지막 수집 시간: {last_collection_time.strftime('%Y-%m-%d %H:%M:%S')} (약 {time_since_last/60:.1f}분 전)")
                 
-                if last_collection_time:
-                    time_diff = (now - last_collection_time).total_seconds()
+                if time_since_last < self.collection_interval:
+                    # 아직 수집 간격이 되지 않았으면 대기
+                    wait_time = self.collection_interval - time_since_last
+                    next_collection = now + timedelta(seconds=wait_time)
+                    logger.info(f"⏳ 서버 '{guild_name}'({guild_id}) 다음 예정 수집 시간: {next_collection.strftime('%Y-%m-%d %H:%M:%S')} (약 {wait_time/60:.1f}분 후)")
                     
-                    if time_diff >= self.collection_interval:
-                        # 수집 간격이 지났으면 수집 시작
-                        logger.info(f"⏰ 수집 간격이 지났습니다 ({time_diff/60:.1f}분). 수집을 시작합니다.")
-                        collected = await self.collect_all_guilds()
-                        
-                        # 다음 예정 수집 시간 계산 및 로그
-                        next_collection = datetime.utcnow() + timedelta(seconds=self.collection_interval)
-                        logger.info(f"⏳ 다음 예정 수집 시간: {next_collection.strftime('%Y-%m-%d %H:%M:%S')}")
+                    # 대기 시간이 길면 여러 번 나눠서 대기 (중간에 봇 재시작 등에 대응)
+                    if wait_time > 300:  # 5분 이상이면
+                        await asyncio.sleep(300)  # 5분 대기
                     else:
-                        # 아직 수집 간격이 되지 않았으면 대기
-                        wait_time = self.collection_interval - time_diff
-                        next_collection = now + timedelta(seconds=wait_time)
-                        
-                        # 실시간 정보 업데이트 (30초마다)
-                        minutes_left = wait_time / 60
-                        if minutes_left > 1:
-                            logger.info(f"⏳ 다음 수집까지 {minutes_left:.1f}분 남음. 예정 시간: {next_collection.strftime('%Y-%m-%d %H:%M:%S')}")
-                            # 30초 단위로 소규모 대기
-                            for _ in range(int(min(minutes_left, 10) * 2)):  # 최대 10분까지만 30초 단위로 분할
-                                await asyncio.sleep(30)
-                        else:
-                            # 1분 미만이면 전체 대기
-                            logger.info(f"⏳ 잠시 후 수집 시작: {wait_time:.1f}초 후")
-                            await asyncio.sleep(wait_time)
+                        await asyncio.sleep(wait_time)
                 else:
-                    # 마지막 수집 시간 정보가 없으면 즉시 수집
-                    logger.warning("⚠️ 마지막 수집 시간 정보가 없습니다. 즉시 수집을 시작합니다.")
-                    collected = await self.collect_all_guilds()
+                    # 수집 간격이 지났으면 수집 시작
+                    logger.info(f"🔄 서버 '{guild_name}'({guild_id}) 마지막 수집 후 {time_since_last/60:.1f}분이 지났습니다. 수집을 시작합니다.")
+                    collected = await self.collect_guild_messages(guild)
+                    logger.info(f"✅ 서버 '{guild_name}'({guild_id}) 수집 완료: {collected}개 메시지")
                     
-                    # 다음 예정 수집 시간 계산 및 로그
-                    next_collection = datetime.utcnow() + timedelta(seconds=self.collection_interval)
-                    logger.info(f"⏳ 다음 예정 수집 시간: {next_collection.strftime('%Y-%m-%d %H:%M:%S')}")
-                
-            except Exception as e:
-                logger.error(f"❌ 스케줄된 메시지 수집 중 오류 발생: {str(e)}")
-                # 오류 발생 시 5분 후 재시도
-                logger.info("⏳ 오류 발생으로 5분 후 재시도합니다.")
-                await asyncio.sleep(300)
-                
+                    # 마지막 수집 시간 업데이트
+                    last_collection_time = datetime.utcnow()
+                    
+                    # 1분 대기 후 다음 주기 시작
+                    await asyncio.sleep(60)
+    
     def start_collection_scheduler(self):
         """메시지 수집 스케줄러 시작"""
         self.collection_task = asyncio.create_task(self.schedule_collection())
         logger.info("🚀 메시지 수집 스케줄러가 시작되었습니다.")
-        return self.collection_task 
+        return self.collection_task
+    
+    async def _save_message(self, message, db_manager):
+        """단일 메시지를 처리하여 DB에 저장
+        
+        Args:
+            message: Discord 메시지 객체
+            db_manager: 사용할 데이터베이스 매니저
+            
+        Returns:
+            성공 여부 (True/False)
+        """
+        try:
+            # 메시지를 딕셔너리로 변환
+            message_dict = self.message_to_dict(message)
+            
+            # 메시지가 유효하면 저장
+            if message_dict:
+                await db_manager.save_messages([message_dict])
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"메시지 저장 중 오류 발생: {str(e)}")
+            return False 

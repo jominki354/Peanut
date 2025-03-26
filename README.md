@@ -144,3 +144,129 @@ python -m peanut
 ## 라이센스
 
 이 프로젝트는 MIT 라이센스에 따라 배포됩니다. 자세한 내용은 LICENSE 파일을 참조하세요. 
+
+# 당근파일럿 데이터 파인튜닝 도구
+
+이 저장소는 [당근파일럿(CarrotPilot) GitBook](https://g4iwnl.gitbook.io/carrotpilot/)에서 크롤링한 데이터를 사용하여 로컬 LLM(Large Language Model)을 파인튜닝하기 위한 도구를 제공합니다.
+
+## 기능
+
+- GitBook 크롤링 스크립트 (`crawl_with_images.py`)
+- llama.cpp를 사용한 파인튜닝 (`finetune_with_llama_cpp.py`)
+- Hugging Face Transformers를 사용한 파인튜닝 (`finetune_with_transformers.py`)
+
+## 사전 요구사항
+
+- Python 3.8 이상
+- Chrome 웹 브라우저 (크롤링 시 필요)
+- GPU (파인튜닝 시 권장)
+
+## 설치 방법
+
+1. 저장소 클론
+
+```bash
+git clone https://github.com/your-username/carrotpilot-finetuning.git
+cd carrotpilot-finetuning
+```
+
+2. 필요한 패키지 설치
+
+```bash
+# 크롤링에 필요한 패키지
+pip install selenium webdriver-manager requests
+
+# llama.cpp 파인튜닝에 필요한 패키지
+pip install llama-cpp-python
+
+# Transformers 파인튜닝에 필요한 패키지
+pip install transformers datasets peft pandas torch accelerate
+pip install bitsandbytes  # 양자화된 모델 학습 시 필요
+```
+
+## 크롤링 사용법
+
+당근파일럿 GitBook에서 데이터를 크롤링하려면:
+
+```bash
+python crawl_with_images.py
+```
+
+크롤링 결과는 `carrotpilot_data_with_images` 디렉토리에 저장됩니다:
+- `crawled_data.json`: 크롤링된 원시 데이터
+- `carrotpilot_finetuning_dataset.json`: 질문-답변 쌍으로 구성된 데이터셋
+- `carrotpilot_finetuning_dataset.jsonl`: JSONL 형식의 데이터셋
+- `images/`: 크롤링된 이미지들
+
+## 파인튜닝 사용법
+
+### llama.cpp 사용 (LoRA 방식)
+
+```bash
+python finetune_with_llama_cpp.py --model path/to/your/model.gguf --model-type llama
+```
+
+추가 옵션:
+- `--model-type`: 모델 유형 (llama, mistral, gemma 중 하나 선택)
+- `--dataset`: 데이터셋 파일 경로
+- `--output-dir`: 결과 저장 디렉토리
+- `--epochs`: 학습 에포크 수
+- `--ctx-size`: 컨텍스트 크기
+
+### Transformers 사용 (LoRA 방식)
+
+```bash
+python finetune_with_transformers.py --model meta-llama/Llama-2-7b --model-type llama
+```
+
+추가 옵션:
+- `--model-type`: 모델 유형 (llama, mistral, gemma 중 하나 선택)
+- `--dataset`: 데이터셋 파일 경로
+- `--output-dir`: 결과 저장 디렉토리
+- `--epochs`: 학습 에포크 수
+- `--batch-size`: 배치 크기
+- `--quantize`: 4비트 양자화 사용 (메모리 사용량 감소)
+
+## 파인튜닝된 모델 사용 예시
+
+### llama.cpp 모델
+
+```python
+from llama_cpp import Llama
+
+model = Llama(
+    model_path="path/to/your/model.gguf",
+    lora_path="carrotpilot_finetuned/carrotpilot-lora.bin",
+    n_ctx=2048,
+    n_gpu_layers=-1  # 가능한 모든 레이어에 GPU 사용
+)
+
+output = model.create_completion("당근파일럿에 대해 알려줘", max_tokens=1024)
+print(output["choices"][0]["text"])
+```
+
+### Transformers 모델
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# 토크나이저와 모델 로드
+tokenizer = AutoTokenizer.from_pretrained("carrotpilot_finetuned_hf/final_model")
+model = AutoModelForCausalLM.from_pretrained("carrotpilot_finetuned_hf/final_model")
+
+# 추론 수행
+prompt = "당근파일럿에 대해 알려줘"
+inputs = tokenizer(prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_length=1024)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+## 주의사항
+
+- 크롤링은 GitBook 서버에 부하를 줄 수 있으므로 적절한 시간 간격을 두고 실행하세요.
+- 파인튜닝은 상당한 컴퓨팅 자원(특히 GPU 메모리)을 필요로 합니다.
+- 모델 유형에 따라 필요한 데이터 형식이 다를 수 있으니 적절한 `model-type` 옵션을 선택하세요.
+
+## 라이센스
+
+이 프로젝트는 MIT 라이센스 하에 배포됩니다. 자세한 내용은 LICENSE 파일을 참조하세요. 
